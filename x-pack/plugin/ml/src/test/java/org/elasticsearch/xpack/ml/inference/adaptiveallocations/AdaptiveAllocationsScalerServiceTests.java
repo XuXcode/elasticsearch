@@ -89,6 +89,14 @@ public class AdaptiveAllocationsScalerServiceTests extends ESTestCase {
     }
 
     private ClusterState getClusterState(int numAllocations, AssignmentState assignmentState) {
+        return getClusterState(numAllocations, assignmentState, new AdaptiveAllocationsSettings(true, null, null));
+    }
+
+    private ClusterState getClusterState(
+        int numAllocations,
+        AssignmentState assignmentState,
+        AdaptiveAllocationsSettings adaptiveAllocationsSettings
+    ) {
         ClusterState clusterState = mock(ClusterState.class);
         Metadata metadata = mock(Metadata.class);
         when(clusterState.metadata()).thenReturn(metadata);
@@ -109,7 +117,7 @@ public class AdaptiveAllocationsScalerServiceTests extends ESTestCase {
                             100_000_000,
                             100_000_000
                         ),
-                        new AdaptiveAllocationsSettings(true, null, null)
+                        adaptiveAllocationsSettings
                     ).setAssignmentState(assignmentState).build()
                 )
             )
@@ -495,17 +503,84 @@ public class AdaptiveAllocationsScalerServiceTests extends ESTestCase {
                 TrainedModelAssignment.Builder.empty(taskParams(1), new AdaptiveAllocationsSettings(Boolean.FALSE, 1, 2)).build()
             )
         );
-        // min allocations > 0
-        assertFalse(
+        // Start at the configured minimum when the assignment has unexpectedly reached zero.
+        assertTrue(
             service.maybeStartAllocation(
-                TrainedModelAssignment.Builder.empty(taskParams(0), new AdaptiveAllocationsSettings(Boolean.TRUE, 1, 2)).build()
+                TrainedModelAssignment.Builder.empty(taskParams(0), new AdaptiveAllocationsSettings(Boolean.TRUE, 2, 2)).build()
             )
         );
+        var minAllocationUpdate = new UpdateTrainedModelDeploymentAction.Request("foo");
+        minAllocationUpdate.setNumberOfAllocations(2);
+        minAllocationUpdate.setSource(UpdateTrainedModelDeploymentAction.Request.Source.ADAPTIVE_ALLOCATIONS);
+        verify(client).execute(eq(UpdateTrainedModelDeploymentAction.INSTANCE), eq(minAllocationUpdate), any());
         assertTrue(
             service.maybeStartAllocation(
                 TrainedModelAssignment.Builder.empty(taskParams(0), new AdaptiveAllocationsSettings(Boolean.TRUE, 0, 2)).build()
             )
         );
+    }
+
+    public void test_scaleUpToMinimum_whenNoNodeStats() throws Exception {
+        AdaptiveAllocationsSettings settings = new AdaptiveAllocationsSettings(true, 1, 2);
+        ClusterState clusterState = getClusterState(0, AssignmentState.STARTED, settings);
+        when(clusterService.state()).thenReturn(clusterState);
+
+        AdaptiveAllocationsScalerService service = new AdaptiveAllocationsScalerService(
+            threadPool,
+            clusterService,
+            client,
+            inferenceAuditor,
+            meterRegistry,
+            true,
+            ONE_SECOND,
+            SIXTY_SECONDS,
+            SIXTY_THOUSAND_MILLISECONDS
+        );
+        service.start();
+
+        when(client.threadPool()).thenReturn(threadPool);
+        doAnswer(invocationOnMock -> {
+            @SuppressWarnings("unchecked")
+            var listener = (ActionListener<GetDeploymentStatsAction.Response>) invocationOnMock.getArguments()[2];
+            listener.onResponse(
+                new GetDeploymentStatsAction.Response(
+                    List.of(),
+                    List.of(),
+                    List.of(
+                        new AssignmentStats(
+                            "test-deployment",
+                            "model-id",
+                            1,
+                            0,
+                            settings,
+                            1024,
+                            ByteSizeValue.ZERO,
+                            Instant.now().minus(1, ChronoUnit.DAYS),
+                            List.of(),
+                            Priority.NORMAL
+                        ).setState(AssignmentState.STARTED)
+                    ),
+                    0
+                )
+            );
+            return Void.TYPE;
+        }).when(client)
+            .execute(eq(GetDeploymentStatsAction.INSTANCE), eq(new GetDeploymentStatsAction.Request("test-deployment")), any());
+        doAnswer(invocationOnMock -> {
+            @SuppressWarnings("unchecked")
+            var listener = (ActionListener<CreateTrainedModelAssignmentAction.Response>) invocationOnMock.getArguments()[2];
+            listener.onResponse(null);
+            return Void.TYPE;
+        }).when(client).execute(eq(UpdateTrainedModelDeploymentAction.INSTANCE), any(), any());
+
+        assertBusy(() -> {
+            var updateRequest = new UpdateTrainedModelDeploymentAction.Request("test-deployment");
+            updateRequest.setNumberOfAllocations(1);
+            updateRequest.setSource(UpdateTrainedModelDeploymentAction.Request.Source.ADAPTIVE_ALLOCATIONS);
+            verify(client).execute(eq(UpdateTrainedModelDeploymentAction.INSTANCE), eq(updateRequest), any());
+        });
+
+        service.stop();
     }
 
     public void testMaybeStartAllocation_BlocksMultipleRequests() throws Exception {
