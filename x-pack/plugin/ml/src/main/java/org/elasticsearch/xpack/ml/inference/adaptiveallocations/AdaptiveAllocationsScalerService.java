@@ -30,6 +30,7 @@ import org.elasticsearch.xpack.core.ClientHelper;
 import org.elasticsearch.xpack.core.ml.action.CreateTrainedModelAssignmentAction;
 import org.elasticsearch.xpack.core.ml.action.GetDeploymentStatsAction;
 import org.elasticsearch.xpack.core.ml.action.UpdateTrainedModelDeploymentAction;
+import org.elasticsearch.xpack.core.ml.inference.assignment.AdaptiveAllocationsSettings;
 import org.elasticsearch.xpack.core.ml.inference.assignment.AssignmentState;
 import org.elasticsearch.xpack.core.ml.inference.assignment.AssignmentStats;
 import org.elasticsearch.xpack.core.ml.inference.assignment.RoutingState;
@@ -436,12 +437,45 @@ public class AdaptiveAllocationsScalerService implements ClusterStateListener {
             }
         }
 
+        Set<String> deploymentsBelowMinimum = new HashSet<>();
+        for (AssignmentStats assignmentStats : statsResponse.getStats().results()) {
+            AdaptiveAllocationsSettings settings = assignmentStats.getAdaptiveAllocationsSettings();
+            Integer minNumberOfAllocations = settings == null ? null : settings.getMinNumberOfAllocations();
+            String deploymentId = assignmentStats.getDeploymentId();
+            int currentNumberOfAllocations = numberOfAllocations.get(deploymentId);
+            if (assignmentStats.getState() == AssignmentState.STARTED
+                && minNumberOfAllocations != null
+                && currentNumberOfAllocations < minNumberOfAllocations) {
+                deploymentsBelowMinimum.add(deploymentId);
+                Long lastScaleUpTimeMillis = lastScaleUpTimesMillis.get(deploymentId);
+                boolean hasRecentScaleUp = lastScaleUpTimeMillis != null
+                    && now < lastScaleUpTimeMillis + scaleUpCooldownTimeMillis.get();
+                if (hasRecentScaleUp == false
+                    && hasRecentObservedScaleUp.contains(deploymentId) == false
+                    && deploymentIdsWithInFlightScaleFromZeroRequests.add(deploymentId)) {
+                    lastScaleUpTimesMillis.put(deploymentId, now);
+                    ActionListener<CreateTrainedModelAssignmentAction.Response> updateListener = updateAssigmentListener(
+                        deploymentId,
+                        minNumberOfAllocations
+                    );
+                    ActionListener<CreateTrainedModelAssignmentAction.Response> cleanUpListener = ActionListener.runAfter(
+                        updateListener,
+                        () -> deploymentIdsWithInFlightScaleFromZeroRequests.remove(deploymentId)
+                    );
+                    updateNumberOfAllocations(deploymentId, minNumberOfAllocations, cleanUpListener);
+                }
+            }
+        }
+
         if (statsTimeInterval == null) {
             return;
         }
 
         for (Map.Entry<String, Stats> deploymentAndStats : recentStatsByDeployment.entrySet()) {
             String deploymentId = deploymentAndStats.getKey();
+            if (deploymentsBelowMinimum.contains(deploymentId)) {
+                continue;
+            }
             Stats stats = deploymentAndStats.getValue();
             AdaptiveAllocationsScaler adaptiveAllocationsScaler = scalers.get(deploymentId);
             adaptiveAllocationsScaler.process(stats, statsTimeInterval, numberOfAllocations.get(deploymentId));
@@ -479,21 +513,20 @@ public class AdaptiveAllocationsScalerService implements ClusterStateListener {
 
     public boolean maybeStartAllocation(TrainedModelAssignment assignment) {
         if (assignment.getAdaptiveAllocationsSettings() != null
-            && assignment.getAdaptiveAllocationsSettings().getEnabled() == Boolean.TRUE
-            && (assignment.getAdaptiveAllocationsSettings().getMinNumberOfAllocations() == null
-                || assignment.getAdaptiveAllocationsSettings().getMinNumberOfAllocations() == 0)) {
+            && assignment.getAdaptiveAllocationsSettings().getEnabled() == Boolean.TRUE) {
 
             // Prevent against a flurry of scale up requests.
-            if (deploymentIdsWithInFlightScaleFromZeroRequests.contains(assignment.getDeploymentId()) == false) {
+            if (deploymentIdsWithInFlightScaleFromZeroRequests.add(assignment.getDeploymentId())) {
                 lastScaleUpTimesMillis.put(assignment.getDeploymentId(), System.currentTimeMillis());
-                var updateListener = updateAssigmentListener(assignment.getDeploymentId(), 1);
+                Integer minNumberOfAllocations = assignment.getAdaptiveAllocationsSettings().getMinNumberOfAllocations();
+                int targetNumberOfAllocations = minNumberOfAllocations == null ? 1 : Math.max(1, minNumberOfAllocations);
+                var updateListener = updateAssigmentListener(assignment.getDeploymentId(), targetNumberOfAllocations);
                 var cleanUpListener = ActionListener.runAfter(
                     updateListener,
                     () -> deploymentIdsWithInFlightScaleFromZeroRequests.remove(assignment.getDeploymentId())
                 );
 
-                deploymentIdsWithInFlightScaleFromZeroRequests.add(assignment.getDeploymentId());
-                updateNumberOfAllocations(assignment.getDeploymentId(), 1, cleanUpListener);
+                updateNumberOfAllocations(assignment.getDeploymentId(), targetNumberOfAllocations, cleanUpListener);
             }
 
             AdaptiveAllocationsScaler scaler = scalers.get(assignment.getDeploymentId());
